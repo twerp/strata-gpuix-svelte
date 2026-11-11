@@ -21,8 +21,15 @@ const LINUX_FILTERS: Partial<Record<FileKinds, string>> = {
 	audio: 'Audio | *.wav *.mp3'
 };
 
+// WinForms wants `name|patterns`, with several patterns separated by semicolons.
+const WIN_FILTERS: Partial<Record<FileKinds, string>> = {
+	image: 'Images|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.heic;*.tif;*.tiff|All files|*.*',
+	audio: 'Audio|*.wav;*.mp3|All files|*.*'
+};
+
 export function picker_available(): { ok: boolean; reason?: string } {
 	if (process.platform === 'darwin') return { ok: true };
+	if (process.platform === 'win32') return Bun.which('powershell') ? { ok: true } : { ok: false, reason: 'the file picker needs Windows PowerShell' };
 	if (process.platform === 'linux' && (Bun.which('zenity') || Bun.which('kdialog'))) return { ok: true };
 	return { ok: false, reason: `no file picker on ${process.platform} — type a path instead` };
 }
@@ -31,6 +38,7 @@ export function picker_available(): { ok: boolean; reason?: string } {
 export async function choose_files({ kinds = 'any', multiple = false, prompt = 'Add to Strata' }: Partial<ChooseOptions> = {}): Promise<string[]> {
 	if (process.platform === 'darwin') return choose_mac({ kinds, multiple, prompt });
 	if (process.platform === 'linux') return choose_linux({ kinds, multiple, prompt });
+	if (process.platform === 'win32') return choose_win({ kinds, multiple, prompt });
 	throw new Error(picker_available().reason);
 }
 
@@ -75,6 +83,7 @@ export async function choose_save_path(name: string, { prompt = 'Export from Str
 		const { stdout, code } = await run(cmd);
 		return code === 0 ? stdout.trim() : '';
 	}
+	if (process.platform === 'win32') return choose_save_win(name, prompt);
 	throw new Error(picker_available().reason);
 }
 
@@ -94,14 +103,73 @@ async function choose_linux({ kinds, multiple, prompt }: ChooseOptions): Promise
 	return stdout.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
-async function run(cmd: string[]) {
-	const proc = track(Bun.spawn(cmd, { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }));
+async function run(cmd: string[], env?: Record<string, string>) {
+	const proc = track(Bun.spawn(cmd, { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', windowsHide: true, ...(env ? { env: { ...process.env, ...env } } : {}) }));
 	const [stdout, stderr, code] = await Promise.all([
 		new Response(proc.stdout).text(),
 		new Response(proc.stderr).text(),
 		proc.exited
 	]);
 	return { stdout, stderr, code };
+}
+
+/**
+ * A dialog owned by a hidden topmost form, so it opens over the app rather than behind it.
+ * Every string reaches PowerShell through the environment: titles and suggested names come
+ * from the user and must not be spliced into the script.
+ */
+async function run_powershell(lines: string[], env: Record<string, string>) {
+	const script = [
+		'$ErrorActionPreference = "Stop"',
+		// UTF-8 so non-ASCII paths survive the redirect; a windowless process may have no console to set it on.
+		'try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }',
+		'Add-Type -AssemblyName System.Windows.Forms',
+		'$owner = New-Object System.Windows.Forms.Form',
+		'$owner.TopMost = $true',
+		'$null = $owner.Handle',
+		...lines,
+		'$owner.Dispose()'
+	].join('\n');
+	const encoded = Buffer.from(script, 'utf16le').toString('base64');
+	return run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], env);
+}
+
+/** Empty on cancel, like the other platforms. */
+async function choose_win({ kinds, multiple, prompt }: ChooseOptions): Promise<string[]> {
+	const { stdout, stderr, code } = await run_powershell([
+		'$d = New-Object System.Windows.Forms.OpenFileDialog',
+		'$d.Title = $env:STRATA_PICK_TITLE',
+		'$d.Multiselect = ($env:STRATA_PICK_MULTIPLE -eq "1")',
+		'$d.Filter = $env:STRATA_PICK_FILTER',
+		'$d.RestoreDirectory = $true',
+		'if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames }'
+	], {
+		STRATA_PICK_TITLE: prompt,
+		STRATA_PICK_MULTIPLE: multiple ? '1' : '0',
+		STRATA_PICK_FILTER: WIN_FILTERS[kinds] ?? 'All files|*.*'
+	});
+	if (code !== 0) throw new Error(stderr.trim() || `the file picker exited ${code}`);
+	return stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+}
+
+/** '' on cancel, like the other platforms. */
+async function choose_save_win(name: string, prompt: string): Promise<string> {
+	const ext = /\.([^.]+)$/.exec(name)?.[1] ?? '';
+	const { stdout, stderr, code } = await run_powershell([
+		'$d = New-Object System.Windows.Forms.SaveFileDialog',
+		'$d.Title = $env:STRATA_PICK_TITLE',
+		'$d.FileName = $env:STRATA_PICK_FILENAME',
+		'$d.Filter = $env:STRATA_PICK_FILTER',
+		'$d.OverwritePrompt = $true',
+		'$d.RestoreDirectory = $true',
+		'if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileName }'
+	], {
+		STRATA_PICK_TITLE: prompt,
+		STRATA_PICK_FILENAME: name,
+		STRATA_PICK_FILTER: ext ? `${ext.toUpperCase()} files|*.${ext}|All files|*.*` : 'All files|*.*'
+	});
+	if (code !== 0) throw new Error(stderr.trim() || `the save dialog exited ${code}`);
+	return stdout.trim();
 }
 
 const RELEASES = 'https://github.com/khromov/strata-gpuix-svelte/releases';
